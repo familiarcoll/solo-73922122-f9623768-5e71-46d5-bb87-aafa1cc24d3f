@@ -12,6 +12,7 @@ solve_controls 表轮询得到，因此两个 API 进程都可以控制对方发
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Any, Callable
@@ -27,6 +28,40 @@ class SolveAborted(Exception):
 
 class SolvePaused(Exception):
     """收到 pause 信号，已消耗的搜索时间随状态一起返回。"""
+
+
+# ---------------------------------------------------------------------------
+# 演示用"求解闸门"：把某个任务的成功返回时机交给外部控制。
+#
+# 当环境变量 SLICE_SOLVE_GATE_DIR 指向一个目录时，worker 在已经找到可行解、
+# 准备返回成功之前会阻塞，直到该目录下出现 release-<gate_token> 文件
+# （gate_token 即 solution_id）。闸门等待期间仍按分片节奏执行 on_tick
+# （刷新心跳）并响应 pause/cancel，因此暂停/取消语义不受影响。
+# 默认不设置该环境变量，求解行为与普通 CP-SAT 完全一致。
+# ---------------------------------------------------------------------------
+_GATE_POLL_SECONDS = 0.1
+
+
+def _wait_gate(
+    gate_token: str | None,
+    control: "_ControlState | None",
+    on_tick: Callable[[], None] | None,
+) -> None:
+    if gate_token is None:
+        return
+    gate_dir = os.environ.get("SLICE_SOLVE_GATE_DIR")
+    if not gate_dir:
+        return
+    release_file = os.path.join(gate_dir, f"release-{gate_token}")
+    while not os.path.exists(release_file):
+        if on_tick is not None:
+            on_tick()
+        if control is not None and control.is_cancelled():
+            raise SolveAborted()
+        if control is not None and control.is_paused():
+            control.elapsed_search = getattr(control, "elapsed_search", 0.0)
+            raise SolvePaused()
+        time.sleep(_GATE_POLL_SECONDS)
 
 
 class _ControlState:
@@ -73,6 +108,7 @@ def build_and_solve(
     control: _ControlState | None = None,
     already_spent: float = 0.0,
     on_tick: Callable[[], None] | None = None,
+    gate_token: str | None = None,
 ) -> dict[str, Any]:
     """执行求解。
 
@@ -171,6 +207,9 @@ def build_and_solve(
             # 可行性问题：找到可行解即满足全部硬约束。
             # min_hold_seconds 仅用于演示可控暂停，让求解过程保持存活。
             if hold_left <= 0:
+                # 演示闸门（默认关闭）：把"成功返回"的时机交给外部，
+                # 用于在双进程环境中确定性地制造"旧求解迟到成功"的交错场景。
+                _wait_gate(gate_token, control, on_tick)
                 break
         if status == cp_model.INFEASIBLE:
             return {
@@ -180,6 +219,7 @@ def build_and_solve(
             }
         if remaining <= 0.05:
             if recorder.best:
+                _wait_gate(gate_token, control, on_tick)
                 break
             return {
                 "status": "infeasible",

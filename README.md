@@ -8,6 +8,11 @@
 - 求解基于 OR-Tools CP-SAT，服务框架为 FastAPI + SQLite；
 - 候选保存求解时刻的**完整输入快照**；求解后任何修改都会使旧候选失效，
   发布返回 `409`，即使把值改回去也无法恢复（版本号单调递增、永不回退）；
+- **重新求解的候选替换是严格原子且不可复活的**：新求解受理后，旧候选在同一
+  事务里被标记 `superseded`，旧 worker 线程迟到的成功/暂停/取消/异常收尾都带
+  归属与状态保护，写入全部空转，旧候选持续 `superseded`、发布返回 `409`；
+- **控制信号按任务隔离**：每个候选在 `solve_controls` 中有独立的一行，旧线程
+  收尾只能清除自己的信号，不可能消费或清除新任务的暂停/恢复/取消信号；
 - 求解在后台线程进行，CP-SAT 计算期间**不持有数据库写锁**，期间可继续
   导入/补样、修改病种、修改冻结；
 - 两个 API 进程共享同一个 SQLite（WAL 模式），任务可跨进程认领、暂停、继续、取消；
@@ -24,9 +29,11 @@ app/
   manager.py     后台求解管理、跨进程认领与控制信号
   main.py        FastAPI 全部 HTTP 接口
 scripts/
-  generate_fixture.py   生成虚构切片 CSV（无真实患者数据）
-tests/           pytest 端到端测试（10 个用例）
-data/            虚构样例数据
+  generate_fixture.py     生成虚构切片 CSV（无真实患者数据）
+  demo.py                 单进程完整流程演示
+  demo_dual_process.py    双进程重新求解/控制交错演示（可控制旧求解返回时机）
+tests/                    pytest 端到端测试（含竞态回归与真实双进程集成）
+data/                     虚构样例数据
 Dockerfile
 docker-compose.yml
 ```
@@ -45,7 +52,26 @@ docker compose up --build -d
 #    http://localhost:8002/docs   （进程 2）
 ```
 
-两个容器挂载同一个命名卷 `slice-data`，数据库文件为 `/data/slices.db`。
+两个容器挂载同一个命名卷 `slice-data`，数据库文件为 `/data/slices.db`；
+演示闸门使用另一个共享卷 `slice-gates`（容器内 `/gates`）。
+
+### 一键演示双进程重新求解竞态
+
+```bash
+docker compose up --build -d
+docker compose run --rm demo
+```
+
+`demo` 服务运行 `scripts/demo_dual_process.py`，自动完成：进程1提交旧求解 A
+（成功返回被闸门拦住）→ 进程2受理新求解 B、A 立即 `superseded` → 发布 A 返回
+`409` → 跨进程暂停 B → 放行 A 的闸门验证迟到成功不复活、也不清掉 B 的暂停
+信号 → 恢复并发布 B → 跨进程取消新任务 C。脚本只依赖标准库，也可在容器外
+对已启动的两个端口运行：
+
+```bash
+SLICE_SOLVE_GATE_DIR=/path/to/gates \
+  python scripts/demo_dual_process.py http://127.0.0.1:8001 http://127.0.0.1:8002
+```
 
 ## 本地运行（不用 Docker）
 
@@ -57,6 +83,18 @@ python scripts/generate_fixture.py
 # 进程 1 / 进程 2，指向同一个数据库文件
 SLICE_DB_PATH=./slices.db uvicorn app.main:app --port 8001
 SLICE_DB_PATH=./slices.db uvicorn app.main:app --port 8002
+```
+
+本地复现双进程竞态演示时，给两个进程再加上同一个闸门目录：
+
+```bash
+mkdir -p /tmp/slice-gates
+SLICE_DB_PATH=./slices.db SLICE_SOLVE_GATE_DIR=/tmp/slice-gates \
+  uvicorn app.main:app --port 8001
+SLICE_DB_PATH=./slices.db SLICE_SOLVE_GATE_DIR=/tmp/slice-gates \
+  uvicorn app.main:app --port 8002
+SLICE_SOLVE_GATE_DIR=/tmp/slice-gates \
+  python scripts/demo_dual_process.py http://127.0.0.1:8001 http://127.0.0.1:8002
 ```
 
 ## 通过 /docs 完成完整流程
@@ -160,6 +198,36 @@ CSV 列：`sample_id,subject_id,disease,group,solution_id,input_version`，
 - 暂停/继续/取消信号写入 `solve_controls` 表，worker 在每个求解分片轮询；
 - 心跳超过 30s 的任务会被另一进程重新认领，单进程崩溃不会卡死任务。
 
+### 候选替换为什么不可"复活"（重新求解竞态）
+
+调整配额、重新划分训练集时会重新提交求解。修复前存在两个缺陷：
+控制信号存在一个全局单行表里，任何任务收尾都会把它清空；worker 写终态时
+只按任务 id 更新、没有归属检查。于是新候选创建后，旧线程迟到的成功会把
+已 `superseded` 的旧候选改回 `solved`（复活、可被误发布），还会顺手清掉
+新任务的暂停信号。修复后的保证：
+
+1. **替换原子化**：`POST /api/solve` 在同一 `BEGIN IMMEDIATE` 事务里把全部旧
+   候选置为 `superseded`、只删除这些旧任务自己的控制行，再插入新候选；
+2. **写入带守卫**：worker 的每一次状态变更都走 `guarded_transition`，
+   SQL 条件为 `id=? AND worker_id=? AND status IN (...)`。任务一旦
+   `superseded` 或被别的进程接管，迟到的 `solved/paused/cancelled/failed`
+   写入影响行数为 0，终态不可被覆盖；
+3. **信号按任务隔离**：`solve_controls` 以 `solution_id` 为主键，每个任务只
+   读/写/删自己的行，旧线程的任何收尾都碰不到新任务的控制信号；
+4. **心跳同样带归属**：被取代或接管的任务不会再被旧 worker 刷新心跳。
+
+因此：旧候选持续 `superseded`、对它的发布与 pause/resume/cancel 一律 `409`；
+新候选可正常暂停、恢复、取消、发布；任意操作交错，失效旧候选都不会复活。
+旧版单行控制表会在启动时自动迁移为按任务隔离的新表。
+
+### 演示用"求解闸门"（控制旧求解的返回时机）
+
+设置环境变量 `SLICE_SOLVE_GATE_DIR` 后，worker 在已经找到可行解、即将成功
+返回之前，会阻塞等待该目录下出现 `release-<solution_id>` 文件；等待期间
+仍刷新心跳并响应暂停/取消。不设置该变量时闸门完全关闭，行为与普通
+CP-SAT 一致。Compose 的两个 API 都把 `/gates` 挂载为共享卷，因此可以从
+外部精确控制任意任务（包括旧任务）何时成功返回，确定性复现交错时序。
+
 ### 无解
 
 配额本身通过校验（总和相等）但与冻结/受试者整组约束矛盾时，CP-SAT 证明无解，
@@ -174,4 +242,10 @@ pytest -q
 
 覆盖：上限校验、配额校验、精确约束、受试者整组、冻结、无解不影响已发布、
 修改即失效（含改回原值）、暂停/继续/取消、求解中并发修改、CSV 一致性、
-发布历史不可变、跨"重启"持久化（独立子进程）。
+发布历史不可变、跨"重启"持久化（独立子进程），以及本修复的专项：
+
+- `tests/test_supersede_race.py`：用可控制返回时机的桩求解器，确定性验证旧
+  求解迟到的成功/暂停/取消/异常均不能复活 `superseded` 候选，新任务的暂停
+  信号在交错操作下不被消费（5 个用例）；
+- `tests/test_dual_process.py`：启动两个真实 uvicorn 进程共享一个 SQLite，
+  经闸门控制旧求解返回时机，验证跨进程替换、`409`、跨进程暂停/恢复/取消/发布。

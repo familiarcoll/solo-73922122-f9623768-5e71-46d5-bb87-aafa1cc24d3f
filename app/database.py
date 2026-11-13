@@ -5,7 +5,10 @@
 - 所有事务都设置 busy_timeout，写冲突时自动等待而不是立刻报 SQLITE_BUSY；
 - 任何有效修改（导入、改病种、改冻结、补样、删除）都会使 metadata.data_version 自增，
   该版本号单调递增、永不回退，因此"改回原值"也无法恢复旧候选；
-- 求解过程不持有任何数据库写锁，只在开始时做一次短暂读快照。
+- 求解过程不持有任何数据库写锁，只在开始时做一次短暂读快照；
+- solve_controls 以 solution_id 为主键、每个候选一行，控制信号按任务隔离；
+- guarded_transition 为 worker 的所有状态写入加上 worker 归属与活跃状态条件，
+  保证被新求解取代（superseded）或被接管的任务不会被旧线程的迟到收尾复活。
 """
 from __future__ import annotations
 
@@ -20,6 +23,17 @@ from .errors import ServiceError
 
 _init_lock = threading.Lock()
 _initialized = False
+
+# 哨兵值：作为字段值传入时，SQL 里直接展开为当前 UTC 时间戳表达式（不绑定参数）。
+SQLITE_NOW = object()
+
+
+def _set_clause(field: str) -> str:
+    return (
+        f"{field} = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+        if field == "heartbeat"
+        else f"{field} = ?"
+    )
 
 
 def reset_for_test() -> None:
@@ -66,10 +80,11 @@ CREATE TABLE IF NOT EXISTS solutions (
 );
 
 -- 求解过程的跨进程控制通道：另一个 API 进程也能写入信号。
+-- 每个候选任务一行（以 solution_id 为主键），任务之间的信号严格隔离：
+-- 旧任务的 worker 收尾时只能清除自己那一行，不可能消费新任务的暂停/取消信号。
 CREATE TABLE IF NOT EXISTS solve_controls (
-    id          INTEGER PRIMARY KEY CHECK (id = 1),
-    solution_id INTEGER,
-    signal      TEXT CHECK (signal IN ('pause', 'resume', 'cancel'))
+    solution_id INTEGER PRIMARY KEY,
+    signal      TEXT NOT NULL CHECK (signal IN ('pause', 'resume', 'cancel'))
 );
 """
 
@@ -89,6 +104,29 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
+def _migrate_controls_table(conn: sqlite3.Connection) -> None:
+    """把旧版单行控制表（id=1）迁移为按 solution_id 隔离的新表。"""
+    cols = {
+        r["name"]
+        for r in conn.execute("PRAGMA table_info(solve_controls)").fetchall()
+    }
+    if not cols or "id" not in cols:
+        return  # 全新库（SCHEMA 已建新表）或已是新结构
+    conn.execute("ALTER TABLE solve_controls RENAME TO solve_controls_legacy")
+    conn.execute(
+        """CREATE TABLE solve_controls (
+               solution_id INTEGER PRIMARY KEY,
+               signal      TEXT NOT NULL CHECK (signal IN ('pause', 'resume', 'cancel'))
+           )"""
+    )
+    conn.execute(
+        """INSERT INTO solve_controls (solution_id, signal)
+           SELECT solution_id, signal FROM solve_controls_legacy
+            WHERE solution_id IS NOT NULL AND signal IS NOT NULL"""
+    )
+    conn.execute("DROP TABLE solve_controls_legacy")
+
+
 def init_db() -> None:
     global _initialized
     with _init_lock:
@@ -97,6 +135,7 @@ def init_db() -> None:
         conn = get_conn()
         try:
             conn.executescript(SCHEMA)
+            _migrate_controls_table(conn)
             conn.execute(
                 "INSERT OR IGNORE INTO metadata (id, data_version) VALUES (1, 1)"
             )
@@ -394,10 +433,84 @@ def claim_pending_solution(conn: sqlite3.Connection, worker_id: str) -> int | No
     return row["id"] if row else None
 
 
-def touch_heartbeat(conn: sqlite3.Connection, solution_id: int) -> None:
+def touch_heartbeat(conn: sqlite3.Connection, solution_id: int,
+                    worker_id: str | None = None) -> int:
+    """刷新心跳。只有当前仍归属该 worker 的活跃任务才会被更新，
+    被新求解取代（superseded）或已被其他进程接管的行不会被动到。返回受影响行数。"""
+    if worker_id is None:
+        cur = conn.execute(
+            "UPDATE solutions SET heartbeat = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
+            "WHERE id = ?",
+            (solution_id,),
+        )
+    else:
+        cur = conn.execute(
+            "UPDATE solutions SET heartbeat = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
+            "WHERE id = ? AND worker_id = ? AND status IN ('solving', 'paused')",
+            (solution_id, worker_id),
+        )
+    return cur.rowcount
+
+
+def guarded_transition(
+    conn: sqlite3.Connection,
+    solution_id: int,
+    worker_id: str,
+    expected_statuses: tuple[str, ...],
+    **fields: Any,
+) -> bool:
+    """仅在任务仍处于期望状态、且仍归属该 worker 时写入状态变更。
+
+    这是防止"旧求解复活"的核心：任务被新求解标记为 superseded（或被其他
+    worker 接管）后，旧 worker 迟到的成功/暂停/取消/异常写入全部空转，
+    终态由这条 WHERE 条件保证不可被覆盖。返回是否真的完成了写入。
+    """
+    if not fields:
+        raise ValueError("guarded_transition requires at least one field")
+    assignments: list[str] = []
+    values: list[Any] = []
+    for key, value in fields.items():
+        if value is SQLITE_NOW:
+            assignments.append(_set_clause(key))
+            continue
+        assignments.append(f"{key} = ?")
+        values.append(
+            json.dumps(value, ensure_ascii=False)
+            if key in ("assignments", "input_snapshot", "quota_request")
+            and value is not None
+            else value
+        )
+    placeholders = ", ".join("?" for _ in expected_statuses)
+    values.extend([solution_id, worker_id])
+    cur = conn.execute(
+        f"UPDATE solutions SET {', '.join(assignments)} "
+        f"WHERE id = ? AND worker_id = ? AND status IN ({placeholders})",
+        values + list(expected_statuses),
+    )
+    return cur.rowcount > 0
+
+
+def write_control(conn: sqlite3.Connection, solution_id: int, signal: str) -> None:
+    """写入/更新某个任务自己的控制信号（按任务隔离，互不覆盖）。"""
     conn.execute(
-        "UPDATE solutions SET heartbeat = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        "INSERT INTO solve_controls (solution_id, signal) VALUES (?, ?) "
+        "ON CONFLICT(solution_id) DO UPDATE SET signal = excluded.signal",
+        (solution_id, signal),
+    )
+
+
+def read_control(conn: sqlite3.Connection, solution_id: int) -> str | None:
+    row = conn.execute(
+        "SELECT signal FROM solve_controls WHERE solution_id = ?",
         (solution_id,),
+    ).fetchone()
+    return row["signal"] if row else None
+
+
+def clear_control(conn: sqlite3.Connection, solution_id: int) -> None:
+    """只删除该任务自己的控制行，绝不触碰其他任务（如新任务）的信号。"""
+    conn.execute(
+        "DELETE FROM solve_controls WHERE solution_id = ?", (solution_id,)
     )
 
 

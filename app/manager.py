@@ -3,16 +3,23 @@
 两个 API 进程各自运行一个 SolveManager。求解任务行写入共享 SQLite 后：
 - 本进程立刻尝试认领；若本进程没有领到（例如在另一进程提交），
   另一进程的监督线程会在 1 秒内扫描并原子认领；
-- 控制信号（pause/resume/cancel）写入 solve_controls 表，
-  worker 每个求解分片轮询该表，因此任一进程都能控制任一任务；
+- 控制信号（pause/resume/cancel）写入 solve_controls 表，每个任务一行、
+  按 solution_id 严格隔离，worker 每个求解分片轮询自己那一行，
+  因此任一进程都能控制任一任务，且旧任务的收尾不可能清掉新任务的信号；
 - 心跳（heartbeat）超时的任务会被其他进程重新认领，单进程崩溃不会卡死任务。
+
+候选替换（重新求解）的防复活不变量：
+- submit 在同一事务里把旧候选置为 superseded，并只删除旧任务自己的控制行；
+- worker 的所有状态写入都经过 database.guarded_transition，仅当任务仍归属
+  本 worker 且仍处于活跃状态（solving/paused）时才生效；旧线程迟到的成功、
+  暂停、取消、异常收尾在任务被取代/接管后全部空转，superseded 终态不可覆盖；
+- 心跳刷新同样带 worker 归属条件。
 
 求解线程只在任务开始/结束时短暂访问数据库，CP-SAT 计算期间不持任何锁，
 因此求解进行中可以继续导入样本、修改病种或冻结归组。
 """
 from __future__ import annotations
 
-import json
 import os
 import socket
 import threading
@@ -21,7 +28,6 @@ import uuid
 from typing import Any
 
 from . import database as db
-from .config import GROUPS
 from .errors import ServiceError
 from .solver import SolveAborted, SolvePaused, _ControlState, build_and_solve
 
@@ -81,13 +87,18 @@ class SolveManager:
 
             # 新候选使旧候选全部作废（标记 superseded；不触碰 published）。
             # 若旧任务正处于 paused，其 worker 还在等待信号，一并置为终态，
-            # worker 醒来后会读到 cancel 信号并退出，不会继续求解已失效任务。
+            # worker 醒来后发现状态已非活跃即退出，不会继续求解已失效任务。
             conn.execute(
                 "UPDATE solutions SET status = 'superseded' "
                 "WHERE kind = 'candidate' AND status != 'superseded'"
             )
+            # 控制通道按任务隔离：只清掉被取代旧任务的信号行，
+            # 绝不能用全局 DELETE 把未来新任务的信号一并抹掉。
             conn.execute(
-                "UPDATE solve_controls SET solution_id = NULL, signal = NULL WHERE id = 1"
+                """DELETE FROM solve_controls
+                    WHERE solution_id IN (
+                        SELECT id FROM solutions
+                         WHERE kind = 'candidate' AND status = 'superseded')"""
             )
             full_request = {
                 "quota": normalized,
@@ -100,10 +111,6 @@ class SolveManager:
                 input_version=snapshot["data_version"],
                 quota_request=full_request,
                 snapshot=snapshot,
-            )
-            # 清空旧控制信号
-            conn.execute(
-                "UPDATE solve_controls SET solution_id = NULL, signal = NULL WHERE id = 1"
             )
             conn.execute("COMMIT")
         except Exception:
@@ -134,12 +141,7 @@ class SolveManager:
             if signal == "cancel" and row["status"] not in ("solving", "paused"):
                 raise ServiceError(409, "任务已结束，无法取消")
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                "INSERT INTO solve_controls (id, solution_id, signal) VALUES (1, ?, ?) "
-                "ON CONFLICT(id) DO UPDATE SET solution_id = excluded.solution_id, "
-                "signal = excluded.signal",
-                (solution_id, signal),
-            )
+            db.write_control(conn, solution_id, signal)
             conn.execute("COMMIT")
         except Exception:
             db._rollback_safely(conn)
@@ -219,7 +221,7 @@ class SolveManager:
                 conn.execute(
                     "UPDATE solutions SET worker_id = ?, "
                     "heartbeat = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
-                    "WHERE id = ? AND worker_id IS NULL",
+                    "WHERE id = ? AND worker_id IS NULL AND status = 'solving'",
                     (self.worker_id, preferred_id),
                 )
             claimed = db.claim_pending_solution(conn, self.worker_id)
@@ -250,49 +252,58 @@ class SolveManager:
     def _read_signal(self, solution_id: int) -> str | None:
         conn = db.get_conn()
         try:
-            row = conn.execute(
-                "SELECT solution_id, signal FROM solve_controls WHERE id = 1"
-            ).fetchone()
-            if row and row["solution_id"] == solution_id:
-                return row["signal"]
-            return None
+            # 每个任务只读自己的控制行，旧任务永远看不到新任务的信号
+            return db.read_control(conn, solution_id)
         finally:
             conn.close()
 
     def _run(self, solution_id: int, _entry: dict) -> None:
-        """任务主循环。控制信号以 solve_controls 表为唯一权威（跨进程生效）。"""
+        """任务主循环。控制信号以 solve_controls 表为唯一权威（跨进程生效）。
+
+        不变量（防"旧求解复活"）：
+        - 对 solutions 的每一次状态写入都经过 guarded_transition，
+          仅当任务仍归属本 worker 且仍处于活跃状态时才生效；
+        - 被新求解取代（superseded）或被其他进程接管后，本线程的任何
+          迟到收尾（成功/暂停/取消/异常）都只会空转，状态不会被改回；
+        - 每个任务只读写自己的控制行，旧线程的收尾不可能清除新任务的信号。
+        """
         try:
             while True:
                 signal = self._read_signal(solution_id)
                 conn = db.get_conn()
                 try:
-                    status = conn.execute(
-                        "SELECT status FROM solutions WHERE id = ?", (solution_id,)
-                    ).fetchone()["status"]
+                    row = conn.execute(
+                        "SELECT status, worker_id FROM solutions WHERE id = ?",
+                        (solution_id,),
+                    ).fetchone()
                 finally:
                     conn.close()
+                if row is None:
+                    return
+                status = row["status"]
 
-                if signal == "cancel" and status in ("solving", "paused"):
-                    self._mark_terminal(solution_id, "cancelled",
-                                        error_message="任务已被取消")
+                # 任务已被新求解取代（superseded）或进入其它终态，或已被
+                # 其他进程接管：本 worker 直接退出，不做任何写入。
+                if status not in ("solving", "paused") or row["worker_id"] != self.worker_id:
                     return
 
-                # 任务已被新求解取代或进入其它终态：worker 直接退出
-                if status not in ("solving", "paused"):
+                if signal == "cancel":
+                    self._mark_terminal(solution_id, "cancelled",
+                                        error_message="任务已被取消")
                     return
 
                 if signal == "resume" and status == "paused":
                     conn = db.get_conn()
                     try:
                         conn.execute("BEGIN IMMEDIATE")
-                        conn.execute(
-                            "UPDATE solutions SET status = 'solving', "
-                            "heartbeat = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
-                            (solution_id,),
+                        moved = db.guarded_transition(
+                            conn, solution_id, self.worker_id,
+                            ("paused",), status="solving",
+                            heartbeat=db.SQLITE_NOW,
                         )
-                        conn.execute(
-                            "UPDATE solve_controls SET signal = NULL WHERE id = 1"
-                        )
+                        if moved:
+                            # 只清除本任务自己的控制行
+                            db.clear_control(conn, solution_id)
                         conn.execute("COMMIT")
                     except Exception:
                         db._rollback_safely(conn)
@@ -312,17 +323,19 @@ class SolveManager:
                         # 任务可能已被新求解标记为 superseded，及时退出
                         c = db.get_conn()
                         try:
-                            cur_status = c.execute(
-                                "SELECT status FROM solutions WHERE id = ?",
+                            cur = c.execute(
+                                "SELECT status, worker_id FROM solutions WHERE id = ?",
                                 (solution_id,),
-                            ).fetchone()["status"]
+                            ).fetchone()
                         finally:
                             c.close()
-                        if cur_status not in ("paused", "solving"):
+                        if (cur is None
+                                or cur["status"] not in ("paused", "solving")
+                                or cur["worker_id"] != self.worker_id):
                             return
                         time.sleep(0.2)
                     continue
-                return  # solved / infeasible / cancelled / failed
+                return  # solved / infeasible / cancelled / failed / 收尾空转
         finally:
             with self._local_lock:
                 self._local.pop(solution_id, None)
@@ -349,7 +362,8 @@ class SolveManager:
         def heartbeat() -> None:
             c = db.get_conn()
             try:
-                db.touch_heartbeat(c, solution_id)
+                # 只刷新仍归本 worker 所有的活跃任务；被取代/接管后空转
+                db.touch_heartbeat(c, solution_id, self.worker_id)
             finally:
                 c.close()
 
@@ -362,6 +376,7 @@ class SolveManager:
                 control=control,
                 already_spent=spent,
                 on_tick=heartbeat,
+                gate_token=str(solution_id),
             )
         except SolveAborted:
             self._mark_terminal(solution_id, "cancelled", error_message="任务已被取消")
@@ -370,8 +385,10 @@ class SolveManager:
             conn = db.get_conn()
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                db.update_solution(
-                    conn, solution_id,
+                # 关键防护：只有仍归属本 worker 的 solving 任务才能被置为 paused。
+                # 若任务此刻已被新求解标记为 superseded，写入空转，旧任务不会复活。
+                moved = db.guarded_transition(
+                    conn, solution_id, self.worker_id, ("solving",),
                     status="paused",
                     spent_seconds=control.elapsed_search,
                 )
@@ -381,8 +398,8 @@ class SolveManager:
                 raise
             finally:
                 conn.close()
-            return "paused"
-        except Exception as exc:  # 求解器自身异常，标记 failed 而不是静默丢失
+            return "paused" if moved else "superseded"
+        except Exception as exc:  # 求解器自身异常：同样不允许复活已失效任务
             self._mark_terminal(solution_id, "failed", error_message=str(exc))
             return "failed"
 
@@ -390,39 +407,46 @@ class SolveManager:
         try:
             conn.execute("BEGIN IMMEDIATE")
             if result["status"] == "solved":
-                db.update_solution(
-                    conn, solution_id,
+                moved = db.guarded_transition(
+                    conn, solution_id, self.worker_id, ("solving",),
                     status="solved",
                     assignments=result["assignments"],
                     spent_seconds=result["search_time_seconds"],
                     error_message=None,
                 )
             else:
-                db.update_solution(
-                    conn, solution_id,
+                moved = db.guarded_transition(
+                    conn, solution_id, self.worker_id, ("solving",),
                     status="infeasible",
                     spent_seconds=result["search_time_seconds"],
                     error_message=result["detail"],
                 )
-            conn.execute(
-                "UPDATE solve_controls SET solution_id = NULL, signal = NULL WHERE id = 1"
-            )
+            if moved:
+                # 仅在状态确实由本 worker 收尾时清除本任务自己的控制行；
+                # 若任务已被取代则什么都不做，尤其不能触碰新任务的信号。
+                db.clear_control(conn, solution_id)
             conn.execute("COMMIT")
         finally:
             conn.close()
-        return result["status"]
+        return result["status"] if moved else "superseded"
 
     def _mark_terminal(self, solution_id: int, status: str,
                        error_message: str | None = None) -> None:
+        """终态写入（取消/失败）。同样带归属与活跃状态保护：
+
+        被新求解取代（superseded）或被其他进程接管后，迟到的取消/异常
+        收尾不会覆盖终态，也不会清除任何其他任务的控制信号。
+        """
         conn = db.get_conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            db.update_solution(
-                conn, solution_id, status=status, error_message=error_message
+            moved = db.guarded_transition(
+                conn, solution_id, self.worker_id, ("solving", "paused"),
+                status=status,
+                error_message=error_message,
             )
-            conn.execute(
-                "UPDATE solve_controls SET solution_id = NULL, signal = NULL WHERE id = 1"
-            )
+            if moved:
+                db.clear_control(conn, solution_id)
             conn.execute("COMMIT")
         finally:
             conn.close()

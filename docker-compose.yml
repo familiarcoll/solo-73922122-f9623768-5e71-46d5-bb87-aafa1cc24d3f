@@ -4,10 +4,14 @@ services:
     container_name: slice-split-api-1
     environment:
       SLICE_DB_PATH: /data/slices.db
+      # 演示用求解闸门：worker 成功返回前等待 /gates/release-<solution_id> 文件，
+      # 不设置该变量时闸门完全关闭、求解行为与普通 CP-SAT 一致。
+      SLICE_SOLVE_GATE_DIR: /gates
     ports:
       - "8001:8000"
     volumes:
       - slice-data:/data
+      - slice-gates:/gates
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s
@@ -20,10 +24,12 @@ services:
     container_name: slice-split-api-2
     environment:
       SLICE_DB_PATH: /data/slices.db
+      SLICE_SOLVE_GATE_DIR: /gates
     ports:
       - "8002:8000"
     volumes:
       - slice-data:/data
+      - slice-gates:/gates
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s
@@ -31,5 +37,23 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # 双进程重新求解竞态演示：docker compose run --rm demo
+  # 脚本通过 8001/8002 两个 API 交错操作，并在共享卷 /gates 上控制旧求解返回时机。
+  demo:
+    build: .
+    profiles: ["demo"]
+    environment:
+      SLICE_SOLVE_GATE_DIR: /gates
+    command: ["python", "scripts/demo_dual_process.py",
+              "http://api-1:8000", "http://api-2:8000"]
+    volumes:
+      - slice-gates:/gates
+    depends_on:
+      api-1:
+        condition: service_healthy
+      api-2:
+        condition: service_healthy
+
 volumes:
   slice-data:
+  slice-gates:

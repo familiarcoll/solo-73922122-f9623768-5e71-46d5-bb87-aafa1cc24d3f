@@ -43,7 +43,9 @@ app = FastAPI(
         "- 同一受试者的全部样本只能进入同一个集合\n"
         "- 各病种在三个集合中的样本数精确满足请求配额\n"
         "- 可冻结指定受试者的归组\n"
-        "- 候选基于求解时刻的完整输入快照；数据一旦修改，旧候选发布即返回 409"
+        "- 候选基于求解时刻的完整输入快照；数据一旦修改，旧候选发布即返回 409\n"
+        "- 重新求解会把旧候选原子置为 superseded 且不可被旧 worker 的迟到收尾复活；\n"
+        "  控制信号按任务隔离，旧任务无法消费新任务的暂停/取消信号"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -232,6 +234,8 @@ def publish(solution_id: int) -> dict[str, Any]:
     """发布候选。
 
     - 候选必须已求解成功；
+    - 已被更新求解取代的候选（superseded）返回 409，且旧 worker 迟到的
+      成功/暂停/取消/异常收尾都不可能把它改回 solved；
     - 候选保存的输入版本必须等于当前数据版本，否则 409
       （求解后任何修改都会导致版本不符，把值改回去也不会回退版本号）；
     - 无解（infeasible）的候选无法发布，已发布结果保持不变。
@@ -243,6 +247,12 @@ def publish(solution_id: int) -> dict[str, Any]:
         if row is None or row["kind"] != "candidate":
             raise ServiceError(404, f"候选不存在: {solution_id}")
         if row["status"] != "solved":
+            if row["status"] == "superseded":
+                raise ServiceError(
+                    409,
+                    "候选已被更新的求解任务取代（superseded），不能发布；"
+                    "请发布最新候选",
+                )
             raise ServiceError(
                 409, f"候选状态为 {row['status']}，只有 solved 的候选可以发布"
             )
@@ -435,3 +445,26 @@ def meta() -> dict[str, Any]:
 @app.get("/health", tags=["系统"])
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/shutdown", tags=["系统"], include_in_schema=False)
+def shutdown() -> dict[str, str]:
+    """测试专用优雅关停：仅在显式设置 SLICE_ENABLE_SHUTDOWN=1 时可用。
+
+    生产/Compose 部署不设置该变量，此端点返回 404 等价的 403，
+    避免任何外部请求关停服务。
+    """
+    import os
+    import threading
+
+    if os.environ.get("SLICE_ENABLE_SHUTDOWN") != "1":
+        raise ServiceError(403, "shutdown endpoint disabled")
+    manager.stop()
+
+    def _exit() -> None:
+        import time as _time
+        _time.sleep(0.1)
+        os._exit(0)
+
+    threading.Thread(target=_exit, daemon=True).start()
+    return {"status": "shutting down"}
