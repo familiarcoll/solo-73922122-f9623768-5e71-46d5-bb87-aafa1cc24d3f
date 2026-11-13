@@ -1,0 +1,35 @@
+services:
+  api-1:
+    build: .
+    container_name: slice-split-api-1
+    environment:
+      SLICE_DB_PATH: /data/slices.db
+    ports:
+      - "8001:8000"
+    volumes:
+      - slice-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  api-2:
+    build: .
+    container_name: slice-split-api-2
+    environment:
+      SLICE_DB_PATH: /data/slices.db
+    ports:
+      - "8002:8000"
+    volumes:
+      - slice-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  slice-data:
